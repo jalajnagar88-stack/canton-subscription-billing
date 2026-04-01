@@ -1,0 +1,112 @@
+module PaymentAuthorisation where
+
+import Subscription (Subscription)
+import BillingCycle (BillingCycle)
+
+-- | Represents a pre-authorisation from a subscriber for a provider to
+-- | pull funds from their wallet for a specific subscription. This is a
+-- | standing instruction that remains active until revoked. It acts as the
+-- | subscriber's consent for recurring charges.
+template PaymentAuthorisation
+  with
+    provider : Party
+      -- ^ The service provider who is authorised to pull funds.
+    subscriber : Party
+      -- ^ The user subscribing to the service and authorising payment.
+    subscriberWallet : Party
+      -- ^ The party representing the subscriber's wallet or bank, responsible
+      -- ^ for executing payment requests.
+    subscriptionCid : ContractId Subscription
+      -- ^ The specific subscription this authorisation is for.
+    maxAmount : Decimal
+      -- ^ The maximum amount that can be withdrawn in a single billing cycle.
+    currency : Text
+      -- ^ The currency of the payment (e.g., "USD", "EUR").
+  where
+    signatory subscriber, subscriberWallet
+    observer provider
+
+    ensure maxAmount > 0.0
+
+    key (provider, subscriber, subscriptionCid) : (Party, Party, ContractId Subscription)
+    maintainer key._2
+
+    -- | Allows the subscriber to cancel the payment authorisation at any time.
+    -- | This prevents any future payment requests from being initiated.
+    nonconsuming choice Revoke : ()
+      controller subscriber
+      do
+        -- On revocation, the authorisation contract is archived.
+        archive self
+
+    -- | Exercised by the provider to initiate a payment pull for a specific
+    -- | billing cycle. This creates a `PaymentRequest` that the wallet must
+    - | then act upon.
+    choice InitiatePayment : ContractId PaymentRequest
+      with
+        amount : Decimal
+          -- ^ The specific amount to be charged for this billing period.
+        billingCycleCid : ContractId BillingCycle
+          -- ^ Reference to the billing cycle this payment covers.
+      controller provider
+      do
+        -- Ensure the requested amount is within the pre-authorised limit.
+        assertMsg ("Payment amount " <> show amount <> " exceeds maximum authorised amount " <> show maxAmount)
+          (amount <= maxAmount)
+        -- Ensure the requested amount is positive.
+        assertMsg "Payment amount must be positive." (amount > 0.0)
+
+        -- Create a specific, one-time payment request for the wallet to process.
+        create PaymentRequest with
+          provider
+          subscriber
+          subscriberWallet
+          amount
+          currency
+          billingCycleCid
+          authorisationCid = self
+
+-- | Represents a specific request for funds sent from a provider to a
+-- | subscriber's wallet, based on an existing `PaymentAuthorisation`.
+-- | This is a transient contract, expected to be settled or rejected promptly.
+template PaymentRequest
+  with
+    provider : Party
+      -- ^ The party requesting the payment.
+    subscriber : Party
+      -- ^ The end-user whose subscription is being paid for.
+    subscriberWallet : Party
+      -- ^ The wallet party that must settle or reject this request.
+    amount : Decimal
+      -- ^ The amount of money to be transferred.
+    currency : Text
+      -- ^ The currency of the payment.
+    billingCycleCid : ContractId BillingCycle
+      -- ^ The billing cycle this payment is for.
+    authorisationCid : ContractId PaymentAuthorisation
+      -- ^ A reference back to the authorisation that permitted this request.
+  where
+    signatory provider, subscriberWallet
+    observer subscriber
+
+    -- | The wallet confirms the transfer of funds, settling the payment.
+    choice Settle : ()
+      controller subscriberWallet
+      do
+        -- In a real-world implementation, this choice would trigger the creation
+        -- of a PaymentReceipt contract and interact with other asset contracts to
+        -- model the actual transfer of value.
+        -- For this example, we simply archive the request upon settlement.
+        pure ()
+
+    -- | The wallet rejects the payment, for example, due to insufficient funds.
+    choice Reject : ()
+      with
+        reason : Text -- ^ The reason for the rejection (e.g., "Insufficient funds").
+      controller subscriberWallet
+      do
+        -- A real-world implementation would create a FailedPayment contract, which
+        -- could then be observed by the Subscription contract to trigger the
+        -- grace period and suspension logic.
+        -- Here, we just archive the request.
+        pure ()
