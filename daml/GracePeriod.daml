@@ -1,0 +1,73 @@
+module GracePeriod where
+
+import Daml.Trigger (Trigger)
+import DA.Date (Date, toDateUTC)
+import DA.Time (getTime)
+import Subscription (Subscription)
+import PaymentAuthorisation (PaymentAuthorisation)
+
+-- | Represents a subscription that has entered a grace period due to a failed payment.
+-- This contract is created by the Subscription template when a billing attempt fails.
+-- It tracks the details of the failure and the deadline for remediation, and provides
+-- choices to either resolve the payment or expire the grace period.
+template GracePeriod
+  with
+    provider : Party
+      -- ^ The service provider who is owed the payment.
+    subscriber : Party
+      -- ^ The subscriber whose payment failed.
+    operator : Party
+      -- ^ An operator party, typically running the automated billing engine.
+    subscriptionCid : ContractId Subscription
+      -- ^ The contract ID of the parent subscription.
+    authorisationCid : ContractId PaymentAuthorisation
+      -- ^ The payment authorisation used for the failed attempt.
+    failedPaymentDate : Date
+      -- ^ The date on which the payment attempt failed.
+    gracePeriodEndDate : Date
+      -- ^ The final date for the subscriber to make the payment before service suspension.
+    amountDue : Decimal
+      -- ^ The outstanding amount that needs to be paid.
+    reason : Text
+      -- ^ The reason for the payment failure (e.g., "Insufficient funds").
+
+  where
+    signatory provider, subscriber
+    observer operator
+
+    key (provider, subscriber, subscriptionCid) : (Party, Party, ContractId Subscription)
+    maintainer key._1
+
+    ensure gracePeriodEndDate > failedPaymentDate
+
+    -- | Choice for the operator or provider to trigger a new payment attempt for the
+    -- | outstanding amount. This is typically invoked by an automated billing trigger.
+    -- | This choice delegates the payment logic to the main Subscription contract.
+    choice AttemptPaymentResolution : ContractId Subscription
+      controller operator, provider
+      do
+        -- This choice signals to the main Subscription contract that a payment
+        -- retry is requested for this grace period. The Subscription's state machine
+        -- is responsible for the core logic of fetching this GracePeriod contract,
+        -- exercising the payment authorisation, and updating its own state accordingly
+        -- (e.g., moving back to Active and archiving this contract on success).
+        exercise subscriptionCid Subscription.ResolveGracePeriodPayment
+          with gracePeriodCid = self
+
+    -- | Choice for the operator or provider to expire the grace period after its
+    -- | end date has passed without successful payment. This leads to the
+    -- | suspension of the service.
+    choice ExpireGracePeriod : ContractId Subscription
+      controller operator, provider
+      do
+        now <- getTime
+        -- Ensure this choice can only be exercised after the grace period has officially ended.
+        assertMsg
+          ("Grace period has not yet expired. Expiry date: " <> show gracePeriodEndDate)
+          (toDateUTC now >= gracePeriodEndDate)
+
+        -- Signal to the Subscription contract that the grace period has expired.
+        -- The Subscription contract will then transition its state to 'Suspended'
+        -- and archive this GracePeriod contract.
+        exercise subscriptionCid Subscription.ProcessGracePeriodExpiry
+          with gracePeriodCid = self
