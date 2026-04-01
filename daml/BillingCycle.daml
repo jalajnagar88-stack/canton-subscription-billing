@@ -1,0 +1,131 @@
+-- | This module defines the contract for a single billing cycle,
+-- | which is created for each billing period of a subscription.
+-- | It manages the payment process, including retries and status tracking.
+module BillingCycle where
+
+import DA.Date
+import DA.Time
+import DA.Numeric
+import DA.Assert
+import DA.Optional
+import Subscription
+
+-- | Defines the start and end dates for a billing cycle.
+data BillingPeriod = BillingPeriod
+  with
+    startDate: Date
+    endDate: Date
+  deriving (Eq, Show, Ord)
+
+-- | Represents the payment status for a given billing cycle.
+data PaymentStatus
+  = PaymentPending      -- Initial state, awaiting payment processing.
+  | PaymentSucceeded    -- Payment was successfully processed.
+  | PaymentFailed       -- An attempt to process payment failed.
+  | InGracePeriod       -- Payment has failed multiple times; subscription is in grace period.
+  deriving (Eq, Show)
+
+
+-- | Represents a single billing cycle for a subscription.
+-- | This contract is typically created by an automated process (e.g., a trigger)
+-- | exercising a choice on the main `Subscription.Contract`.
+template BillingCycle
+  with
+    subscriptionCid: ContractId Subscription.Contract
+    -- The full subscription data is copied for context and to avoid fetches.
+    subscriptionData: Subscription.Contract
+    billingEngine: Party
+    period: BillingPeriod
+    amountDue: Decimal
+    status: PaymentStatus
+    lastAttemptTime: Optional Time
+    attemptCount: Int
+
+  where
+    signatory subscriptionData.provider, subscriptionData.subscriber, billingEngine
+    observer subscriptionData.provider, subscriptionData.subscriber
+
+    key (subscriptionData.provider, subscriptionData.subscriber, period.startDate) : (Party, Party, Date)
+    maintainer key._1
+
+    -- Maximum number of payment retries before moving to a grace period.
+    let maxAttempts = 3
+
+    ensure
+      amountDue > 0.0 &&
+      period.endDate >= period.startDate
+
+    -- | Choice exercised by the billing engine to process the payment.
+    -- | In a real implementation, this would interact with payment gateway contracts.
+    -- | Here we simulate the outcome with a boolean parameter.
+    nonconsuming choice ProcessPayment: ContractId BillingCycle
+      with
+        currentTime: Time
+        paymentSucceeded: Bool
+      controller billingEngine
+      do
+        assertMsg "Cannot process payment for a cycle that is not pending or has failed"
+          (self.status == PaymentPending || self.status == PaymentFailed)
+        assertMsg "Maximum retry attempts exceeded" (self.attemptCount < maxAttempts)
+
+        let newAttemptCount = self.attemptCount + 1
+
+        if paymentSucceeded then do
+          -- On success, update the main subscription contract to reflect the payment.
+          exercise subscriptionCid Subscription.AcknowledgePayment with
+            billedPeriod = self.period
+            paidAmount = self.amountDue
+            paymentDate = toDateUTC currentTime
+
+          -- Create the final, successful BillingCycle contract and this one will be archived.
+          create this with
+            status = PaymentSucceeded
+            lastAttemptTime = Some currentTime
+            attemptCount = newAttemptCount
+
+        else do
+          -- On failure, check if we should enter a grace period.
+          if newAttemptCount >= maxAttempts then do
+            -- Move the main subscription into a grace period
+            exercise subscriptionCid Subscription.EnterGracePeriod with
+              failedPeriod = self.period
+              reason = "Maximum payment attempts (" <> show maxAttempts <> ") failed for period starting " <> show self.period.startDate
+
+            -- Update this cycle's status to reflect the grace period
+            create this with
+              status = InGracePeriod
+              lastAttemptTime = Some currentTime
+              attemptCount = newAttemptCount
+          else
+            -- Still have retries left, just mark as failed and wait for the next attempt.
+            create this with
+              status = PaymentFailed
+              lastAttemptTime = Some currentTime
+              attemptCount = newAttemptCount
+
+    -- | Allows an administrator or provider to manually resolve a failed payment.
+    nonconsuming choice MarkAsPaidManually: ContractId BillingCycle
+      with
+        currentTime: Time
+        reason: Text
+      controller subscriptionData.provider, billingEngine
+      do
+        assertMsg "Cannot manually mark a succeeded payment as paid again" (self.status /= PaymentSucceeded)
+
+        -- Update the main subscription contract
+        exercise subscriptionCid Subscription.AcknowledgePayment with
+          billedPeriod = self.period
+          paidAmount = self.amountDue
+          paymentDate = toDateUTC currentTime
+
+        -- Create the final, successful BillingCycle contract.
+        create this with
+          status = PaymentSucceeded
+          lastAttemptTime = Some currentTime
+
+    -- | Choice to clean up a completed (successful) billing cycle contract from the active state.
+    choice ArchiveCompletedCycle: ()
+      controller subscriptionData.provider, subscriptionData.subscriber, billingEngine
+      do
+        assertMsg "Can only archive a cycle that has successfully been paid" (self.status == PaymentSucceeded)
+        return ()
