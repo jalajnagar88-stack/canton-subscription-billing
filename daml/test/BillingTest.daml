@@ -1,0 +1,174 @@
+module Subscription.Test.BillingTest where
+
+import Daml.Script
+
+import Subscription.Subscription
+import Subscription.BillingCycle
+import Subscription.PaymentAuthorisation
+import Subscription.GracePeriod
+
+import DA.Date as D
+import DA.Time
+import DA.Assert
+
+-- === Test Setup ===
+
+setup = script do
+  provider <- allocateParty "Provider"
+  subscriber <- allocateParty "Subscriber"
+  billingEngine <- allocateParty "BillingEngine"
+
+  now <- getTime
+  let today = D.date (year now) (month now) (day now)
+
+  -- Create a payment authorisation with sufficient funds
+  paymentAuthCid <- submit subscriber do
+    createCmd PaymentAuthorisation with
+      subscriber
+      provider
+      maxAmount = 100.0
+      sufficientFunds = True
+
+  -- Create an active subscription
+  subscriptionCid <- submit provider do
+    createCmd Subscription with
+      provider
+      subscriber
+      billingEngine
+      planName = "Premium Plan"
+      amount = 29.99
+      periodDays = 30
+      status = Active
+      startDate = today
+      lastPaymentDate = today
+      paymentAuthCid
+
+  pure (provider, subscriber, billingEngine, subscriptionCid, paymentAuthCid)
+
+-- === Test Suite ===
+
+billingTests = script do
+  testHappyPathBilling
+  testFailedPaymentEntersGracePeriod
+  testGracePeriodExpiryTerminatesSubscription
+
+-- === Test Cases ===
+
+testHappyPathBilling = script do
+  p "Running: testHappyPathBilling..."
+  (provider, subscriber, billingEngine, subscriptionCid, _) <- setup
+
+  -- The provider or billing engine initiates the first billing cycle
+  (billingCycleCid, _) <- submit provider do
+    exerciseCmd subscriptionCid CreateBillingCycle
+
+  -- The billing engine processes the payment
+  (newSubscriptionCid, nextBillingCycleCid) <- submit billingEngine do
+    exerciseCmd billingCycleCid ProcessBillingCycle
+
+  -- Assertions
+  -- 1. The original billing cycle should be archived.
+  query @BillingCycle provider
+    >>= assertEq [(billingCycleCid, Inactive)] . map (\(cid, _c) -> (cid, Active)) . filter (\(cid, c) -> cid == billingCycleCid)
+    where
+      isArchived (cid, c) = cid == billingCycleCid
+      isActive (cid, c) = cid == billingCycleCid
+
+  -- 2. A new billing cycle for the next period should exist.
+  newCycleContracts <- query @BillingCycle provider
+  assertEq 1 (length newCycleContracts)
+  let (fetchedNextCid, _) = head newCycleContracts
+  assertEq nextBillingCycleCid fetchedNextCid
+
+  -- 3. The subscription's last payment date should be updated.
+  sub <- fetch newSubscriptionCid
+  let expectedPaymentDate = D.addDays sub.startDate sub.periodDays
+  assertEq expectedPaymentDate sub.lastPaymentDate
+  assertEq Active sub.status
+  p "SUCCESS: testHappyPathBilling"
+
+
+testFailedPaymentEntersGracePeriod = script do
+  p "Running: testFailedPaymentEntersGracePeriod..."
+  (provider, subscriber, billingEngine, subscriptionCid, paymentAuthCid) <- setup
+
+  -- Simulate insufficient funds by replacing the authorisation contract
+  submit subscriber do archiveCmd paymentAuthCid
+  failedPaymentAuthCid <- submit subscriber do
+    createCmd PaymentAuthorisation with
+      subscriber
+      provider
+      maxAmount = 100.0
+      sufficientFunds = False
+
+  -- Link the subscription to the new, failing payment authorisation
+  updatedSubCid <- submit provider do
+    exerciseCmd subscriptionCid UpdatePaymentAuthorisation with newPaymentAuthCid = failedPaymentAuthCid
+
+  -- Initiate the billing cycle
+  (billingCycleCid, _) <- submit provider do
+    exerciseCmd updatedSubCid CreateBillingCycle
+
+  -- The billing engine attempts to process the payment, which should fail
+  (updatedSubCidAfterFailure, gracePeriodCid) <- submit billingEngine do
+    exerciseCmd billingCycleCid ProcessFailedPayment
+
+  -- Assertions
+  -- 1. A grace period contract should have been created.
+  gracePeriodContracts <- query @GracePeriod provider
+  assertEq 1 (length gracePeriodContracts)
+  let (fetchedGraceCid, _) = head gracePeriodContracts
+  assertEq gracePeriodCid fetchedGraceCid
+
+  -- 2. The subscription status should be Suspended.
+  sub <- fetch updatedSubCidAfterFailure
+  assertEq Suspended sub.status
+
+  -- 3. The original billing cycle should be archived.
+  query @BillingCycle provider
+    >>= assertEq []
+
+  p "SUCCESS: testFailedPaymentEntersGracePeriod"
+
+
+testGracePeriodExpiryTerminatesSubscription = script do
+  p "Running: testGracePeriodExpiryTerminatesSubscription..."
+  (provider, subscriber, billingEngine, subscriptionCid, paymentAuthCid) <- setup
+
+  -- === Same setup as the failed payment test to get into a grace period ===
+  submit subscriber do archiveCmd paymentAuthCid
+  failedPaymentAuthCid <- submit subscriber do
+    createCmd PaymentAuthorisation with
+      subscriber
+      provider
+      maxAmount = 100.0
+      sufficientFunds = False
+  updatedSubCid <- submit provider do
+    exerciseCmd subscriptionCid UpdatePaymentAuthorisation with newPaymentAuthCid = failedPaymentAuthCid
+  (billingCycleCid, _) <- submit provider do
+    exerciseCmd updatedSubCid CreateBillingCycle
+  (subCidInGrace, gracePeriodCid) <- submit billingEngine do
+    exerciseCmd billingCycleCid ProcessFailedPayment
+  -- === End of grace period setup ===
+
+  -- Fetch the grace period contract to get its expiry date
+  gracePeriod <- fetch gracePeriodCid
+  let expiryTime = time (D.addDays gracePeriod.expiresOn 1) 0 0 0
+
+  -- Advance ledger time past the grace period expiry
+  setTime expiryTime
+
+  -- The billing engine exercises the choice to expire the grace period
+  terminatedSubCid <- submit billingEngine do
+    exerciseCmd gracePeriodCid Expire
+
+  -- Assertions
+  -- 1. The grace period contract should be archived.
+  query @GracePeriod provider
+    >>= assertEq []
+
+  -- 2. The subscription status should now be Terminated.
+  sub <- fetch terminatedSubCid
+  assertEq Terminated sub.status
+
+  p "SUCCESS: testGracePeriodExpiryTerminatesSubscription"
