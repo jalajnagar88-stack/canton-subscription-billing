@@ -1,0 +1,142 @@
+module Subscription where
+
+import DA.Date
+import DA.Time
+import DA.Assert
+
+-- | Defines the status of a subscription contract, tracking its lifecycle.
+data SubscriptionStatus
+  = Pending     -- ^ The subscription has been proposed but not yet activated.
+  | Active      -- ^ The subscription is current and payments are up-to-date.
+  | GracePeriod -- ^ A payment has failed, but the service is still active for a short period.
+  | Suspended   -- ^ Service has been suspended due to prolonged non-payment.
+  | Terminated  -- ^ The subscription has been permanently ended by either party.
+  deriving (Eq, Show, Ord)
+
+-- | Defines the frequency of billing cycles.
+data BillingPeriod
+  = Monthly
+  | Quarterly
+  | Annually
+  deriving (Eq, Show, Ord)
+
+-- | Helper function to calculate the next billing date based on the period.
+calculateNextBillingDate : BillingPeriod -> Date -> Date
+calculateNextBillingDate period currentDate =
+  case period of
+    Monthly   -> addMonths 1 currentDate
+    Quarterly -> addMonths 3 currentDate
+    Annually  -> addYears 1 currentDate
+
+-- | Represents an agreement between a service provider and a subscriber for a recurring service.
+-- The `billingEngine` party is responsible for automating the payment process.
+template Subscription
+  with
+    subscriber : Party
+      -- ^ The party subscribing to the service and making payments.
+    provider : Party
+      -- ^ The party providing the service and receiving payments.
+    billingEngine : Party
+      -- ^ An automated party responsible for triggering billing cycles.
+    subscriptionId : Text
+      -- ^ A unique identifier for this specific subscription agreement.
+    description : Text
+      -- ^ A human-readable description of the subscribed service.
+    price : Decimal
+      -- ^ The cost per billing period.
+    currency : Text
+      -- ^ The currency of the price (e.g., "USD", "EUR").
+    period : BillingPeriod
+      -- ^ The frequency of billing cycles.
+    startDate : Date
+      -- ^ The date the subscription first became active.
+    nextBillingDate : Date
+      -- ^ The date on which the next payment is due.
+    status : SubscriptionStatus
+      -- ^ The current state of the subscription.
+    failedPaymentAttempts : Int
+      -- ^ A counter for consecutive failed payment attempts.
+    lastPaymentDate : Optional Date
+      -- ^ The date of the last successful payment.
+
+  where
+    signatory subscriber, provider
+    observer billingEngine
+
+    let maxFailedAttempts = 3
+
+    ensure price > 0.0 && currency /= "" && subscriptionId /= ""
+
+    key (provider, subscriber, subscriptionId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | Choice for the subscriber to cancel their subscription.
+    -- This is a non-consuming choice that creates a `Cancelled` contract as a record.
+    choice Cancel : ContractId Subscription
+      controller subscriber
+      do
+        assertMsg "Subscription cannot be cancelled when it is already suspended or terminated."
+          (status `elem` [Pending, Active, GracePeriod])
+
+        create this with status = Terminated
+
+    -- | Choice for the provider to terminate a suspended subscription.
+    choice Terminate : ContractId Subscription
+      controller provider
+      do
+        assertMsg "Subscription must be in a Suspended state to be terminated by the provider."
+          (status == Suspended)
+
+        create this with status = Terminated
+
+    -- | Exercised by the billing engine to record a successful payment.
+    -- It resets the subscription to an `Active` state and calculates the next billing date.
+    choice AcknowledgePayment : ContractId Subscription
+      with
+        paymentDate : Date
+          -- ^ The date the successful payment was processed.
+      controller billingEngine
+      do
+        assertMsg "Cannot acknowledge payment for a terminated subscription."
+          (status /= Terminated)
+
+        create this with
+          status = Active
+          lastPaymentDate = Some paymentDate
+          failedPaymentAttempts = 0
+          nextBillingDate = calculateNextBillingDate this.period paymentDate
+
+    -- | Exercised by the billing engine to record a failed payment attempt.
+    -- If the failure threshold is not yet met, the subscription enters a `GracePeriod`.
+    -- Otherwise, it is moved to `Suspended`.
+    choice RecordFailedPayment : ContractId Subscription
+      controller billingEngine
+      do
+        assertMsg "Cannot record failed payment for a terminated subscription."
+          (status /= Terminated)
+
+        let newFailureCount = failedPaymentAttempts + 1
+        let newStatus = if newFailureCount >= maxFailedAttempts
+                        then Suspended
+                        else GracePeriod
+
+        create this with
+          failedPaymentAttempts = newFailureCount
+          status = newStatus
+
+    -- | Allows the provider to manually reactivate a subscription, for example,
+    -- after an out-of-band payment has been received.
+    choice Reactivate : ContractId Subscription
+      with
+        reactivationDate : Date
+          -- ^ The date from which the subscription is considered active again.
+      controller provider
+      do
+        assertMsg "Subscription must be in GracePeriod or Suspended to be reactivated."
+          (status `elem` [GracePeriod, Suspended])
+
+        create this with
+          status = Active
+          failedPaymentAttempts = 0
+          lastPaymentDate = Some reactivationDate
+          nextBillingDate = calculateNextBillingDate this.period reactivationDate
