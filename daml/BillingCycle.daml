@@ -1,131 +1,78 @@
--- | This module defines the contract for a single billing cycle,
--- | which is created for each billing period of a subscription.
--- | It manages the payment process, including retries and status tracking.
+-- | This module defines the data types and functions for handling recurring billing cycles.
+-- It includes logic for calculating billing periods for monthly and yearly subscriptions,
+-- ensuring that periods are contiguous and without gaps or overlaps.
 module BillingCycle where
 
-import DA.Date
-import DA.Time
-import DA.Numeric
-import DA.Assert
-import DA.Optional
-import Subscription
+import DA.Date as D
+import DA.Time as T
 
--- | Defines the start and end dates for a billing cycle.
-data BillingPeriod = BillingPeriod
-  with
-    startDate: Date
-    endDate: Date
+-- |Defines the frequency of the billing cycle.
+data BillingCycleType = Monthly | Yearly
   deriving (Eq, Show, Ord)
 
--- | Represents the payment status for a given billing cycle.
-data PaymentStatus
-  = PaymentPending      -- Initial state, awaiting payment processing.
-  | PaymentSucceeded    -- Payment was successfully processed.
-  | PaymentFailed       -- An attempt to process payment failed.
-  | InGracePeriod       -- Payment has failed multiple times; subscription is in grace period.
-  deriving (Eq, Show)
+-- |Represents a single billing period with a start and end time.
+-- The interval is inclusive of the start time and exclusive of the end time, i.e., [start, end).
+data BillingPeriod = BillingPeriod with
+  start : T.Time
+  end : T.Time
+  deriving (Eq, Show, Ord)
+
+-- |Adds a number of months to a given Time, preserving the time of day.
+-- Handles cases like adding a month to Jan 31st correctly (resulting in Feb 28th/29th).
+addMonthsToTime : Int -> T.Time -> T.Time
+addMonthsToTime months t =
+  let
+    (y, m, d) = D.toGregorian (T.toDate t)
+
+    -- Calculate the total number of months from year 0
+    totalMonths = D.monthToMonth m + months
+
+    -- Determine the new year and month
+    newY = y + (totalMonths - 1) / 12
+    newM = D.monthFromMonth $ (totalMonths - 1) % 12 + 1
+
+    -- DA.Date.fromGregorian safely handles clamping the day for shorter months.
+    -- e.g., adding 1 month to Jan 31 gives Feb 28/29.
+    newDate = D.fromGregorian newY newM d
+
+    -- To preserve the time of day, we extract it from the original Time.
+    -- A Time is microseconds since epoch. A Date is days since epoch.
+    microsecondsPerDay = 86_400_000_000
+    timeOfDayMicros = T.toMicroseconds t % microsecondsPerDay
+
+  in T.fromMicroseconds (D.toDateMicros newDate + timeOfDayMicros)
+
+-- |Adds a number of years to a given Time, preserving the time of day.
+addYearsToTime : Int -> T.Time -> T.Time
+addYearsToTime years t = addMonthsToTime (years * 12) t
 
 
--- | Represents a single billing cycle for a subscription.
--- | This contract is typically created by an automated process (e.g., a trigger)
--- | exercising a choice on the main `Subscription.Contract`.
-template BillingCycle
-  with
-    subscriptionCid: ContractId Subscription.Contract
-    -- The full subscription data is copied for context and to avoid fetches.
-    subscriptionData: Subscription.Contract
-    billingEngine: Party
-    period: BillingPeriod
-    amountDue: Decimal
-    status: PaymentStatus
-    lastAttemptTime: Optional Time
-    attemptCount: Int
+-- |Calculates the very first billing period for a new subscription.
+calculateInitialBillingPeriod : BillingCycleType -> T.Time -> BillingPeriod
+calculateInitialBillingPeriod cycleType startTime =
+  let
+    endTime = case cycleType of
+      Monthly -> addMonthsToTime 1 startTime
+      Yearly -> addYearsToTime 1 startTime
+  in BillingPeriod with start = startTime, end = endTime
 
-  where
-    signatory subscriptionData.provider, subscriptionData.subscriber, billingEngine
-    observer subscriptionData.provider, subscriptionData.subscriber
+-- |Calculates the next billing period based on the current one.
+-- This function fixes a potential off-by-one error by ensuring periods are contiguous.
+-- The new period starts exactly when the old one ends, representing the interval [start, end).
+calculateNextBillingPeriod : BillingCycleType -> BillingPeriod -> BillingPeriod
+calculateNextBillingPeriod cycleType currentPeriod =
+  let
+    -- The start of the next period is exactly the end of the current one.
+    -- This creates a seamless timeline with no gaps or overlaps.
+    nextStart = currentPeriod.end
 
-    key (subscriptionData.provider, subscriptionData.subscriber, period.startDate) : (Party, Party, Date)
-    maintainer key._1
+    nextEnd = case cycleType of
+      Monthly -> addMonthsToTime 1 nextStart
+      Yearly  -> addYearsToTime 1 nextStart
+  in BillingPeriod with start = nextStart, end = nextEnd
 
-    -- Maximum number of payment retries before moving to a grace period.
-    let maxAttempts = 3
-
-    ensure
-      amountDue > 0.0 &&
-      period.endDate >= period.startDate
-
-    -- | Choice exercised by the billing engine to process the payment.
-    -- | In a real implementation, this would interact with payment gateway contracts.
-    -- | Here we simulate the outcome with a boolean parameter.
-    nonconsuming choice ProcessPayment: ContractId BillingCycle
-      with
-        currentTime: Time
-        paymentSucceeded: Bool
-      controller billingEngine
-      do
-        assertMsg "Cannot process payment for a cycle that is not pending or has failed"
-          (self.status == PaymentPending || self.status == PaymentFailed)
-        assertMsg "Maximum retry attempts exceeded" (self.attemptCount < maxAttempts)
-
-        let newAttemptCount = self.attemptCount + 1
-
-        if paymentSucceeded then do
-          -- On success, update the main subscription contract to reflect the payment.
-          exercise subscriptionCid Subscription.AcknowledgePayment with
-            billedPeriod = self.period
-            paidAmount = self.amountDue
-            paymentDate = toDateUTC currentTime
-
-          -- Create the final, successful BillingCycle contract and this one will be archived.
-          create this with
-            status = PaymentSucceeded
-            lastAttemptTime = Some currentTime
-            attemptCount = newAttemptCount
-
-        else do
-          -- On failure, check if we should enter a grace period.
-          if newAttemptCount >= maxAttempts then do
-            -- Move the main subscription into a grace period
-            exercise subscriptionCid Subscription.EnterGracePeriod with
-              failedPeriod = self.period
-              reason = "Maximum payment attempts (" <> show maxAttempts <> ") failed for period starting " <> show self.period.startDate
-
-            -- Update this cycle's status to reflect the grace period
-            create this with
-              status = InGracePeriod
-              lastAttemptTime = Some currentTime
-              attemptCount = newAttemptCount
-          else
-            -- Still have retries left, just mark as failed and wait for the next attempt.
-            create this with
-              status = PaymentFailed
-              lastAttemptTime = Some currentTime
-              attemptCount = newAttemptCount
-
-    -- | Allows an administrator or provider to manually resolve a failed payment.
-    nonconsuming choice MarkAsPaidManually: ContractId BillingCycle
-      with
-        currentTime: Time
-        reason: Text
-      controller subscriptionData.provider, billingEngine
-      do
-        assertMsg "Cannot manually mark a succeeded payment as paid again" (self.status /= PaymentSucceeded)
-
-        -- Update the main subscription contract
-        exercise subscriptionCid Subscription.AcknowledgePayment with
-          billedPeriod = self.period
-          paidAmount = self.amountDue
-          paymentDate = toDateUTC currentTime
-
-        -- Create the final, successful BillingCycle contract.
-        create this with
-          status = PaymentSucceeded
-          lastAttemptTime = Some currentTime
-
-    -- | Choice to clean up a completed (successful) billing cycle contract from the active state.
-    choice ArchiveCompletedCycle: ()
-      controller subscriptionData.provider, subscriptionData.subscriber, billingEngine
-      do
-        assertMsg "Can only archive a cycle that has successfully been paid" (self.status == PaymentSucceeded)
-        return ()
+-- |Checks if a given time falls within the billing period.
+-- The check is inclusive of the start time and exclusive of the end time.
+isTimeInPeriod : T.Time -> BillingPeriod -> Bool
+isTimeInPeriod t period =
+  t >= period.start && t < period.end
