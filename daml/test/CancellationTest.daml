@@ -1,0 +1,226 @@
+module Subscription.Test.CancellationTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as D
+import DA.Time as T
+import DA.Optional (isSome, isNone)
+import DA.List (find)
+
+-- Assuming these modules and templates exist from other files in the project
+import Subscription.Subscription (Subscription(..), SubscriptionAgreement(..), SubscriptionStatus(..))
+import Subscription.Cancellation (CancellationRequest(..), CancellationConfirmation(..))
+
+
+-- === Test Setup ===
+
+-- Test parameters
+let
+  testProvider = "Provider"
+  testSubscriber = "Subscriber"
+  testOperator = "Operator"
+  monthlyPrice = 30.0
+  billingCycle = 30
+
+-- A helper to set up parties for each test scenario.
+setupEnv : Script (Party, Party, Party)
+setupEnv = do
+  provider <- allocateParty testProvider
+  subscriber <- allocateParty testSubscriber
+  operator <- allocateParty testOperator
+  pure (provider, subscriber, operator)
+
+-- A helper to create a standard, active subscription for use in tests.
+createActiveSubscription : Party -> Party -> Party -> Script (ContractId Subscription)
+createActiveSubscription provider subscriber operator = do
+  now <- getTime
+  let startDate = D.fromGregorian_ y m d where (y, m, d) = toGregorian $ timeToDate now
+  let agreement = SubscriptionAgreement with
+        provider
+        subscriber
+        operator
+        price = monthlyPrice
+        billingCycleDays = billingCycle
+        agreementText = "Standard Monthly Plan"
+
+  agreementCid <- submit provider do
+    create agreement
+
+  submit subscriber do
+    exercise agreementCid ActivateSubscription with
+      subscriptionStartDate = startDate
+
+
+-- === Test Suite ===
+
+cancellationTests : Script ()
+cancellationTests = script do
+  "test_successful_cancellation_with_prorated_refund" ~> test_successful_cancellation_with_prorated_refund
+  "test_cancellation_of_suspended_subscription_has_no_refund" ~> test_cancellation_of_suspended_subscription_has_no_refund
+  "test_cancellation_fails_if_already_pending" ~> test_cancellation_fails_if_already_pending
+  "test_resubscribe_after_full_cancellation_is_possible" ~> test_resubscribe_after_full_cancellation_is_possible
+
+
+-- === Test Cases ===
+
+-- Verifies that a user cancelling mid-cycle receives a correct, pro-rated refund.
+test_successful_cancellation_with_prorated_refund : Script ()
+test_successful_cancellation_with_prorated_refund = do
+  (provider, subscriber, operator) <- setupEnv
+
+  -- 1. Setup: Create a subscription and advance time to be 10 days into the cycle.
+  startTime <- getTime
+  let startDate = D.fromGregorian_ y m d where (y, m, d) = toGregorian $ timeToDate startTime
+
+  agreementCid <- submit provider do
+    create SubscriptionAgreement with provider, subscriber, operator, price = monthlyPrice, billingCycleDays = billingCycle, agreementText = "Test Plan"
+  subCid <- submit subscriber do
+    exercise agreementCid ActivateSubscription with subscriptionStartDate = startDate
+
+  -- Advance time by 10 days into the 30-day cycle.
+  let cancellationTime = T.addRelTime (days 10) startTime
+  setTime cancellationTime
+
+  -- 2. Action: Subscriber requests cancellation.
+  (reqCid, _) <- submit subscriber do
+    exercise subCid RequestCancellation
+
+  -- 3. Verification:
+  -- A CancellationRequest contract should now exist.
+  req <- fetch reqCid
+  req.provider === provider
+  req.subscriber === subscriber
+  req.subscriptionCid === subCid
+
+  -- The provider processes the cancellation request.
+  (confCid, _) <- submit provider do
+    exercise reqCid ProcessCancellation
+
+  -- The original Subscription contract should be archived.
+  (query @(ContractId Subscription) provider subscriber).contracts === []
+
+  -- A CancellationConfirmation contract should exist with the correct details.
+  conf <- fetch confCid
+  conf.provider === provider
+  conf.subscriber === subscriber
+
+  -- Refund calculation check:
+  -- A 30-day subscription costs $30.0.
+  -- Cancelled after 10 days means 20 days were unused.
+  -- Refund should be (20 / 30) * 30.0 = $20.0
+  let expectedRefund = (intToDecimal (billingCycle - 10)) / (intToDecimal billingCycle) * monthlyPrice
+  conf.refundAmount === expectedRefund
+
+  let expectedCancellationDate = D.fromGregorian_ y m d where (y, m, d) = toGregorian $ timeToDate cancellationTime
+  conf.cancellationDate === expectedCancellationDate
+
+  pure ()
+
+
+-- Verifies that a user with a suspended subscription does not receive a refund upon cancellation.
+test_cancellation_of_suspended_subscription_has_no_refund : Script ()
+test_cancellation_of_suspended_subscription_has_no_refund = do
+  (provider, subscriber, operator) <- setupEnv
+
+  -- 1. Setup: Create a subscription and have the operator suspend it.
+  subCid <- createActiveSubscription provider subscriber operator
+
+  -- Assuming an administrative choice `ForceSuspend` exists for testing or operational needs.
+  suspendedSubCid <- submit operator do
+    exercise subCid ForceSuspend with reason = "Test suspension for non-payment"
+
+  suspendedSub <- fetch suspendedSubCid
+  suspendedSub.status === Suspended "Test suspension for non-payment"
+
+  -- 2. Action: Subscriber requests cancellation of the suspended subscription.
+  (reqCid, _) <- submit subscriber do
+    exercise suspendedSubCid RequestCancellation
+
+  -- 3. Verification:
+  -- Provider processes the cancellation.
+  (confCid, _) <- submit provider do
+    exercise reqCid ProcessCancellation
+
+  -- The Subscription contract should be archived.
+  (query @(ContractId Subscription) provider subscriber).contracts === []
+
+  -- The CancellationConfirmation should confirm a refund amount of zero.
+  conf <- fetch confCid
+  conf.provider === provider
+  conf.subscriber === subscriber
+  conf.refundAmount === 0.0
+
+  pure ()
+
+
+-- Verifies that a subscriber cannot request cancellation more than once on the same subscription.
+test_cancellation_fails_if_already_pending : Script ()
+test_cancellation_fails_if_already_pending = do
+  (provider, subscriber, operator) <- setupEnv
+
+  -- 1. Setup: Create a subscription and request cancellation once.
+  subCid <- createActiveSubscription provider subscriber operator
+  (reqCid, _) <- submit subscriber do
+    exercise subCid RequestCancellation
+
+  -- Fetch the updated subscription, which should now be in a 'CancellationPending' state.
+  -- This state change prevents further actions on the original contract.
+  sub <- fetch subCid
+  sub.status === CancellationPending
+
+  -- 2. Action & Verification: Attempting to request cancellation again must fail.
+  submitMustFail subscriber do
+    exercise subCid RequestCancellation
+
+  pure ()
+
+
+-- Verifies that a former subscriber can sign up for a new subscription after their
+-- previous one has been fully cancelled.
+test_resubscribe_after_full_cancellation_is_possible : Script ()
+test_resubscribe_after_full_cancellation_is_possible = do
+  (provider, subscriber, operator) <- setupEnv
+
+  -- 1. Setup: Go through a full cancellation cycle.
+  subCid <- createActiveSubscription provider subscriber operator
+  (reqCid, _) <- submit subscriber do
+    exercise subCid RequestCancellation
+  (confCid, _) <- submit provider do
+    exercise reqCid ProcessCancellation
+
+  -- Verify the old subscription is gone and a confirmation exists.
+  (query @Subscription provider).contracts === []
+  confs <- query @CancellationConfirmation provider
+  assertMsg "CancellationConfirmation should exist" $ isSome (find (\c -> c.subscriber == subscriber) (map snd confs))
+
+  -- 2. Action: Create a new subscription agreement for the same parties.
+  let newAgreement = SubscriptionAgreement with
+        provider
+        subscriber
+        operator
+        price = monthlyPrice + 10.0 -- A new plan with a different price.
+        billingCycleDays = billingCycle
+        agreementText = "Premium Re-subscribed Plan"
+
+  newAgreementCid <- submit provider do
+    create newAgreement
+
+  -- Subscriber accepts and activates the new subscription.
+  now <- getTime
+  let newStartDate = D.fromGregorian_ y m d where (y, m, d) = toGregorian $ timeToDate now
+  newSubCid <- submit subscriber do
+    exercise newAgreementCid ActivateSubscription with
+      subscriptionStartDate = newStartDate
+
+  -- 3. Verification: A new, active subscription contract should now exist.
+  newSub <- fetch newSubCid
+  newSub.provider === provider
+  newSub.subscriber === subscriber
+  newSub.status === Active
+  newSub.price === monthlyPrice + 10.0
+
+  -- Ensure only one active subscription exists for this subscriber.
+  subs <- query @Subscription provider
+  length (filter (\c -> c.subscriber == subscriber) (map snd subs)) === 1
+
+  pure ()
