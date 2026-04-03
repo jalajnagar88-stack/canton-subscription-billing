@@ -1,0 +1,144 @@
+module Cancellation where
+
+import DA.Date
+import DA.Time
+import DA.Decimal
+import DA.Assert
+
+-- This module assumes the existence of a `Subscription.Subscription` template.
+-- A choice on that template, like `RequestCancellation`, would be responsible for
+-- creating this `CancellationRequest`.
+import qualified Subscription
+
+-- | Represents a subscriber's request to cancel their active subscription.
+-- This contract initiates the cancellation workflow. It is created by the
+-- subscriber and must be processed by the provider to finalize the cancellation
+-- and issue any applicable refund.
+template CancellationRequest
+  with
+    provider: Party
+      -- ^ The subscription service provider.
+    subscriber: Party
+      -- ^ The party subscribed to the service.
+    subscriptionCid: ContractId Subscription.Subscription
+      -- ^ The contract ID of the active subscription to be cancelled.
+    requestTime: Time
+      -- ^ The timestamp when the cancellation was requested.
+  where
+    signatory subscriber, provider
+
+    -- | The provider processes the cancellation request. This action calculates
+    -- | the prorated refund based on the remaining days in the billing cycle,
+    -- | archives the original subscription to stop future billing, and creates
+    -- | a `ProratedRefundObligation` for the provider to settle.
+    choice ProcessCancellation : ContractId ProratedRefundObligation
+      controller provider
+      do
+        now <- getTime
+        sub <- fetch subscriptionCid
+
+        -- Pre-condition checks
+        assertMsg "Subscription must be active to be cancelled." sub.isActive
+
+        let cancellationDate = toDateUTC now
+        assertMsg "Cancellation date must be within the current billing period."
+          (cancellationDate >= sub.currentPeriodStart && cancellationDate <= sub.currentPeriodEnd)
+
+        -- Calculate prorated refund amount.
+        -- We use `DA.Date.toDays` to convert dates to an integer epoch day count,
+        -- which simplifies calculating the number of days in a period.
+        let
+          -- The total number of days in the billing period. Add 1 to be inclusive.
+          totalDaysInPeriod = toDays sub.currentPeriodEnd - toDays sub.currentPeriodStart + 1
+
+          -- The number of days the service was used in the current period. Add 1 to be inclusive.
+          daysUsed = toDays cancellationDate - toDays sub.currentPeriodStart + 1
+
+        -- Ensure calculation inputs are valid. `daysUsed` should not exceed `totalDaysInPeriod`
+        -- due to the date check above, but this makes the logic more robust.
+        let daysRemaining = if totalDaysInPeriod > daysUsed then totalDaysInPeriod - daysUsed else 0
+
+        let
+          refundAmount = if totalDaysInPeriod > 0 && daysRemaining > 0
+            then
+              -- Calculate the cost per day and multiply by days remaining.
+              let dailyRate = sub.monthlyFee / intToDecimal totalDaysInPeriod
+              -- Round to 2 decimal places for currency.
+              in roundDecimal 2 (dailyRate * intToDecimal daysRemaining)
+            else
+              -- No refund is due if the period is over or malformed.
+              0.0
+
+        -- Archive the active subscription contract. This is the key step that
+        -- prevents future billing cycles and terminates the service.
+        archive subscriptionCid
+
+        -- Create a refund obligation for the provider. This contract serves as a
+        -- record of the refund due, which can be settled (usually off-ledger).
+        create ProratedRefundObligation with
+            provider
+            recipient = subscriber
+            amount = refundAmount
+            reason = if refundAmount > 0.0
+                       then "Prorated refund for subscription cancelled on " <> show cancellationDate <> "."
+                       else "Subscription cancelled on " <> show cancellationDate <> ". No refund due for the current period."
+            subscriptionCid
+
+    -- | The subscriber can withdraw their cancellation request as long as the provider
+    -- | has not yet processed it. This simply removes the request, leaving the
+    -- | original subscription active.
+    choice WithdrawCancellationRequest : ()
+      controller subscriber
+      do
+        pure ()
+
+-- | An obligation for the subscription provider to issue a prorated refund
+-- | to the subscriber. This contract is created when a `CancellationRequest`
+-- | is successfully processed and a refund is due.
+template ProratedRefundObligation
+  with
+    provider: Party
+      -- ^ The party obligated to pay the refund.
+    recipient: Party
+      -- ^ The party who will receive the refund.
+    amount: Decimal
+      -- ^ The prorated amount to be refunded. Must be zero or greater.
+    reason: Text
+      -- ^ A description of why the refund was issued.
+    subscriptionCid: ContractId Subscription.Subscription
+      -- ^ A reference to the original (now archived) subscription.
+  where
+    signatory provider
+    observer recipient
+
+    ensure amount >= 0.0
+
+    -- | A non-consuming choice for the provider to signal that the refund has
+    -- | been paid through an external payment system. This is for record-keeping;
+    -- | the actual funds transfer happens off-ledger.
+    choice MarkAsSettled : ContractId SettledRefund
+      controller provider
+      do
+        now <- getTime
+        create SettledRefund with
+          provider
+          recipient
+          amount
+          reason
+          subscriptionCid
+          settledTime = now
+
+-- | A final state contract indicating that a prorated refund has been settled
+-- | by the provider. This serves as an immutable historical record of the
+-- | completed refund transaction.
+template SettledRefund
+  with
+    provider: Party
+    recipient: Party
+    amount: Decimal
+    reason: Text
+    subscriptionCid: ContractId Subscription.Subscription
+    settledTime: Time
+  where
+    signatory provider
+    observer recipient
