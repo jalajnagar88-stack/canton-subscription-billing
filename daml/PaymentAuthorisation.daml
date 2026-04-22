@@ -1,112 +1,118 @@
-module PaymentAuthorisation where
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 
-import Subscription (Subscription)
-import BillingCycle (BillingCycle)
+module Subscription.PaymentAuthorisation where
 
--- | Represents a pre-authorisation from a subscriber for a provider to
--- | pull funds from their wallet for a specific subscription. This is a
--- | standing instruction that remains active until revoked. It acts as the
--- | subscriber's consent for recurring charges.
+import DA.Date (Date, addDays)
+import DA.Next.Set (Set, insert, delete, member, size, toList)
+import DA.Optional (Optional(..))
+import Daml.Finance.Interface.Types.Common.Types (Account)
+
+-- | Represents a subscriber's standing authorisation for a service provider to
+-- | pull funds from a designated account for recurring payments.
+-- | This contract is signed by the subscriber and serves as the foundational
+-- | agreement for a subscription. The billing engine(s) can then use this
+-- | authorisation to initiate debits for each billing cycle.
 template PaymentAuthorisation
   with
-    provider : Party
-      -- ^ The service provider who is authorised to pull funds.
     subscriber : Party
-      -- ^ The user subscribing to the service and authorising payment.
-    subscriberWallet : Party
-      -- ^ The party representing the subscriber's wallet or bank, responsible
-      -- ^ for executing payment requests.
-    subscriptionCid : ContractId Subscription
-      -- ^ The specific subscription this authorisation is for.
-    maxAmount : Decimal
-      -- ^ The maximum amount that can be withdrawn in a single billing cycle.
+      -- ^ The party authorising the payments (the customer).
+    walletProvider : Party
+      -- ^ The custodian of the `sourceAccount`, e.g., a bank or wallet gateway.
+    billingEngines : Set Party
+      -- ^ A set of parties authorised to initiate debits. This allows for
+      -- | operational flexibility, like key rotation or using multiple payment
+      -- | processors, without needing new subscriber consent.
+    sourceAccount : Account
+      -- ^ The specific account from which funds will be debited.
     currency : Text
-      -- ^ The currency of the payment (e.g., "USD", "EUR").
+      -- ^ The currency of the payments (e.g., "USD", "EUR").
+    maxAmountPerPayment : Decimal
+      -- ^ The maximum amount that can be charged in a single payment, protecting
+      -- | the subscriber from overcharging.
+    paymentIntervalDays : Int
+      -- ^ The minimum number of days that must pass between payments.
+    lastPaymentDate : Optional Date
+      -- ^ The date of the last successful payment. `None` if no payment has
+      -- | been made yet. Used to enforce the `paymentIntervalDays`.
+    id : Text
+      -- ^ A unique identifier for this authorisation, for correlation with
+      -- | off-ledger systems.
+
   where
-    signatory subscriber, subscriberWallet
-    observer provider
+    signatory subscriber
+    observer walletProvider, (toList billingEngines)
 
-    ensure maxAmount > 0.0
+    key (subscriber, walletProvider, id) : (Party, Party, Text)
+    maintainer key._1
 
-    key (provider, subscriber, subscriptionCid) : (Party, Party, ContractId Subscription)
-    maintainer key._2
+    -- | A choice exercised by an authorised billing engine to initiate a payment.
+    -- | It validates the charge against the authorisation's rules and updates
+    -- | the last payment date upon success.
+    choice Debit : (ContractId PaymentAuthorisation, Account)
+      controller (toList billingEngines)
+      with
+        amountToDebit : Decimal
+          -- ^ The amount to be debited for the current billing cycle.
+        invoiceId : Text
+          -- ^ A reference to the invoice this payment is for.
+        chargeDate : Date
+          -- ^ The date of the current charge attempt.
+      do
+        let controller = head (signatories self)
+        assertMsg ("Party " <> show controller <> " is not an authorized billing engine.")
+          (member controller billingEngines)
 
-    -- | Allows the subscriber to cancel the payment authorisation at any time.
-    -- | This prevents any future payment requests from being initiated.
-    nonconsuming choice Revoke : ()
+        assertMsg ("Debit amount must be positive.")
+          (amountToDebit > 0.0)
+
+        assertMsg ("Debit amount " <> show amountToDebit <> " exceeds maximum of " <> show maxAmountPerPayment <> ".")
+          (amountToDebit <= maxAmountPerPayment)
+
+        assertMsg ("Account currency (" <> sourceAccount.id.label <> ") does not match authorisation currency (" <> currency <> ").")
+          (sourceAccount.id.label == currency)
+
+        case lastPaymentDate of
+          None -> pure ()
+          Some lastDate ->
+            let nextAllowedDate = addDays lastDate paymentIntervalDays
+            in assertMsg ("Payment interval not met. Last payment was on " <> show lastDate <>
+                          ", next is allowed on or after " <> show nextAllowedDate <> ".")
+                         (chargeDate >= nextAllowedDate)
+
+        newCid <- create this with lastPaymentDate = Some chargeDate
+        return (newCid, sourceAccount)
+
+    -- | Allows the subscriber to authorise an additional party to act as a
+    -- | billing engine.
+    choice AddBillingEngine : ContractId PaymentAuthorisation
+      controller subscriber
+      with
+        newEngine: Party
+          -- ^ The new party to add to the set of authorised billing engines.
+      do
+        assertMsg ("Party " <> show newEngine <> " is already an authorized billing engine.")
+          (not $ member newEngine billingEngines)
+        create this with billingEngines = insert newEngine billingEngines
+
+    -- | Allows the subscriber to revoke a party's authorisation to act as a
+    -- | billing engine.
+    choice RemoveBillingEngine : ContractId PaymentAuthorisation
+      controller subscriber
+      with
+        engineToRemove: Party
+          -- ^ The party to remove from the set of authorised billing engines.
+      do
+        assertMsg ("Party " <> show engineToRemove <> " is not an authorized billing engine.")
+          (member engineToRemove billingEngines)
+        let updatedEngines = delete engineToRemove billingEngines
+        assertMsg "Cannot remove the last billing engine, as it would render the authorisation unusable. Archive it instead."
+          (size updatedEngines > 0)
+        create this with billingEngines = updatedEngines
+
+    -- | Allows the subscriber to completely revoke and terminate the payment
+    -- | authorisation.
+    choice Archive : ()
       controller subscriber
       do
-        -- On revocation, the authorisation contract is archived.
-        archive self
-
-    -- | Exercised by the provider to initiate a payment pull for a specific
-    -- | billing cycle. This creates a `PaymentRequest` that the wallet must
-    - | then act upon.
-    choice InitiatePayment : ContractId PaymentRequest
-      with
-        amount : Decimal
-          -- ^ The specific amount to be charged for this billing period.
-        billingCycleCid : ContractId BillingCycle
-          -- ^ Reference to the billing cycle this payment covers.
-      controller provider
-      do
-        -- Ensure the requested amount is within the pre-authorised limit.
-        assertMsg ("Payment amount " <> show amount <> " exceeds maximum authorised amount " <> show maxAmount)
-          (amount <= maxAmount)
-        -- Ensure the requested amount is positive.
-        assertMsg "Payment amount must be positive." (amount > 0.0)
-
-        -- Create a specific, one-time payment request for the wallet to process.
-        create PaymentRequest with
-          provider
-          subscriber
-          subscriberWallet
-          amount
-          currency
-          billingCycleCid
-          authorisationCid = self
-
--- | Represents a specific request for funds sent from a provider to a
--- | subscriber's wallet, based on an existing `PaymentAuthorisation`.
--- | This is a transient contract, expected to be settled or rejected promptly.
-template PaymentRequest
-  with
-    provider : Party
-      -- ^ The party requesting the payment.
-    subscriber : Party
-      -- ^ The end-user whose subscription is being paid for.
-    subscriberWallet : Party
-      -- ^ The wallet party that must settle or reject this request.
-    amount : Decimal
-      -- ^ The amount of money to be transferred.
-    currency : Text
-      -- ^ The currency of the payment.
-    billingCycleCid : ContractId BillingCycle
-      -- ^ The billing cycle this payment is for.
-    authorisationCid : ContractId PaymentAuthorisation
-      -- ^ A reference back to the authorisation that permitted this request.
-  where
-    signatory provider, subscriberWallet
-    observer subscriber
-
-    -- | The wallet confirms the transfer of funds, settling the payment.
-    choice Settle : ()
-      controller subscriberWallet
-      do
-        -- In a real-world implementation, this choice would trigger the creation
-        -- of a PaymentReceipt contract and interact with other asset contracts to
-        -- model the actual transfer of value.
-        -- For this example, we simply archive the request upon settlement.
-        pure ()
-
-    -- | The wallet rejects the payment, for example, due to insufficient funds.
-    choice Reject : ()
-      with
-        reason : Text -- ^ The reason for the rejection (e.g., "Insufficient funds").
-      controller subscriberWallet
-      do
-        -- A real-world implementation would create a FailedPayment contract, which
-        -- could then be observed by the Subscription contract to trigger the
-        -- grace period and suspension logic.
-        -- Here, we just archive the request.
         pure ()
