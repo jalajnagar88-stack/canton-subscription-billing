@@ -1,78 +1,93 @@
--- | This module defines the data types and functions for handling recurring billing cycles.
--- It includes logic for calculating billing periods for monthly and yearly subscriptions,
--- ensuring that periods are contiguous and without gaps or overlaps.
-module BillingCycle where
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 
-import DA.Date as D
-import DA.Time as T
+module Subscription.BillingCycle where
 
--- |Defines the frequency of the billing cycle.
-data BillingCycleType = Monthly | Yearly
-  deriving (Eq, Show, Ord)
+import Daml.Script
 
--- |Represents a single billing period with a start and end time.
--- The interval is inclusive of the start time and exclusive of the end time, i.e., [start, end).
-data BillingPeriod = BillingPeriod with
-  start : T.Time
-  end : T.Time
-  deriving (Eq, Show, Ord)
+import DA.Date
+import DA.Time
+import DA.Assert
 
--- |Adds a number of months to a given Time, preserving the time of day.
--- Handles cases like adding a month to Jan 31st correctly (resulting in Feb 28th/29th).
-addMonthsToTime : Int -> T.Time -> T.Time
-addMonthsToTime months t =
-  let
-    (y, m, d) = D.toGregorian (T.toDate t)
+import Subscription.Subscription (Subscription(..))
+import Subscription.Invoice (Invoice(..))
+import Subscription.Setup (SubscriptionDetails(..))
 
-    -- Calculate the total number of months from year 0
-    totalMonths = D.monthToMonth m + months
+-- | Represents the scheduled task to generate an invoice for a given subscription.
+-- This contract is created when a subscription starts and is recreated each time
+-- an invoice is generated, effectively scheduling the next billing event. It acts
+-- as the heart of the recurring billing engine.
+template BillingCycle
+  with
+    billingEngine : Party
+      -- ^ The party responsible for managing the billing process.
+    subscriber : Party
+      -- ^ The party being billed.
+    subscriptionCid : ContractId Subscription
+      -- ^ The active subscription contract this billing cycle is for.
+    nextBillingDate : Date
+      -- ^ The date on which the next invoice should be generated.
+  where
+    signatory billingEngine
+    observer subscriber
 
-    -- Determine the new year and month
-    newY = y + (totalMonths - 1) / 12
-    newM = D.monthFromMonth $ (totalMonths - 1) % 12 + 1
+    key (billingEngine, subscriber, subscriptionCid) : (Party, Party, ContractId Subscription)
+    maintainer key._1
 
-    -- DA.Date.fromGregorian safely handles clamping the day for shorter months.
-    -- e.g., adding 1 month to Jan 31 gives Feb 28/29.
-    newDate = D.fromGregorian newY newM d
+    -- | Triggers the creation of a new invoice for the subscription.
+    -- This choice should be exercised by an automated process (e.g., a trigger or off-ledger bot)
+    -- on or after the `nextBillingDate`. The choice consumes the current cycle and creates
+    -- the next one, perpetuating the billing schedule.
+    choice TriggerInvoice : ContractId Invoice
+      controller billingEngine
+      do
+        -- Ensure the choice is exercised on or after the scheduled billing date.
+        -- This prevents generating invoices prematurely.
+        now <- getTime
+        let currentDate = toDateUTC now
+        assertMsg
+          ("Cannot trigger invoice before the next billing date of " <> show nextBillingDate)
+          (currentDate >= nextBillingDate)
 
-    -- To preserve the time of day, we extract it from the original Time.
-    -- A Time is microseconds since epoch. A Date is days since epoch.
-    microsecondsPerDay = 86_400_000_000
-    timeOfDayMicros = T.toMicroseconds t % microsecondsPerDay
+        -- Fetch the subscription details to create the invoice.
+        sub <- fetch subscriptionCid
+        let details = sub.details
 
-  in T.fromMicroseconds (D.toDateMicros newDate + timeOfDayMicros)
+        -- Calculate invoice period and due date based on subscription terms.
+        let invoicePeriodStart = nextBillingDate
+        let invoicePeriodEnd = addMonths 1 nextBillingDate `addDays` (-1)
+        let dueDate = currentDate `addDays` details.paymentGracePeriodDays
 
--- |Adds a number of years to a given Time, preserving the time of day.
-addYearsToTime : Int -> T.Time -> T.Time
-addYearsToTime years t = addMonthsToTime (years * 12) t
+        -- Create the new invoice for the current billing period.
+        invoiceCid <- create Invoice with
+          billingEngine = billingEngine
+          subscriber = subscriber
+          subscriptionCid = subscriptionCid
+          amount = details.billingAmount
+          currency = details.billingCurrency
+          description = details.description
+          periodStart = invoicePeriodStart
+          periodEnd = invoicePeriodEnd
+          issueDate = currentDate
+          dueDate = dueDate
+          status = "Pending"
+          paymentDetails = None
+          lateFee = None
 
+        -- Recreate the billing cycle for the next period, ensuring the cycle continues.
+        let nextPeriodBillingDate = addMonths 1 nextBillingDate
+        create this with
+          nextBillingDate = nextPeriodBillingDate
 
--- |Calculates the very first billing period for a new subscription.
-calculateInitialBillingPeriod : BillingCycleType -> T.Time -> BillingPeriod
-calculateInitialBillingPeriod cycleType startTime =
-  let
-    endTime = case cycleType of
-      Monthly -> addMonthsToTime 1 startTime
-      Yearly -> addYearsToTime 1 startTime
-  in BillingPeriod with start = startTime, end = endTime
+        return invoiceCid
 
--- |Calculates the next billing period based on the current one.
--- This function fixes a potential off-by-one error by ensuring periods are contiguous.
--- The new period starts exactly when the old one ends, representing the interval [start, end).
-calculateNextBillingPeriod : BillingCycleType -> BillingPeriod -> BillingPeriod
-calculateNextBillingPeriod cycleType currentPeriod =
-  let
-    -- The start of the next period is exactly the end of the current one.
-    -- This creates a seamless timeline with no gaps or overlaps.
-    nextStart = currentPeriod.end
-
-    nextEnd = case cycleType of
-      Monthly -> addMonthsToTime 1 nextStart
-      Yearly  -> addYearsToTime 1 nextStart
-  in BillingPeriod with start = nextStart, end = nextEnd
-
--- |Checks if a given time falls within the billing period.
--- The check is inclusive of the start time and exclusive of the end time.
-isTimeInPeriod : T.Time -> BillingPeriod -> Bool
-isTimeInPeriod t period =
-  t >= period.start && t < period.end
+    -- | Archives the billing cycle, typically when the parent subscription is cancelled or terminated.
+    -- This stops the recurring invoice generation.
+    choice ArchiveBillingCycle : ()
+      with
+        reason : Text
+          -- ^ The reason for archiving (e.g., "Subscription cancelled by subscriber").
+      controller billingEngine
+      do
+        debug $ "Archiving billing cycle for subscription " <> show subscriptionCid <> ". Reason: " <> reason
+        return ()
