@@ -1,163 +1,182 @@
 # Canton Subscription Billing
 
-This project provides a robust, decentralized subscription billing and payment enforcement system built on the Canton Network using Daml smart contracts. It enables merchants to offer subscription-based services with automated, transparent, and enforceable payment cycles.
+[![CI](https://github.com/your-org/canton-subscription-billing/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/canton-subscription-billing/actions/workflows/ci.yml)
 
-## Overview
+A decentralized, automated solution for managing recurring subscription payments on the Canton Network. This project provides a set of Daml smart contracts to handle the complete subscription lifecycle, from creation and billing to dunning and cancellation, ensuring transparent and enforceable agreements between merchants and subscribers.
 
-The core of the system is a set of Daml templates that model the entire subscription lifecycle, from initial agreement to recurring payments, and handling of delinquencies. By encoding the business logic in smart contracts, all parties (Merchant, Subscriber, and the automated Billing Engine) have a shared, immutable source of truth for every subscription's state.
+## Features
 
-**Key Features:**
--   **Automated Recurring Payments:** A `BillingEngine` party automatically processes payments at the start of each billing cycle.
--   **Transparent State Management:** All state changes (e.g., payment success, failure, suspension) are recorded on the ledger, visible to authorized parties.
--   **Enforceable Contracts:** The rules for payment failures, grace periods, and service suspension are baked into the smart contracts, ensuring they are followed without manual intervention.
--   **Decentralized & Interoperable:** Built on Canton, allowing different organizations to interact securely without a central intermediary.
+-   **Automated Recurring Billing:** Invoices are generated automatically at the start of each billing cycle.
+-   **On-Chain Payment Enforcement:** Payments are settled atomically using Canton's token standards.
+-   **Dunning Management:** A built-in workflow handles payment failures, moving subscriptions through a grace period, suspension, and eventual termination.
+-   **Transparent Lifecycle:** All state changes (e.g., activation, suspension, cancellation) are recorded immutably on the ledger, visible to both merchant and subscriber.
+-   **Mutual Cancellation:** A fair, two-step cancellation process that respects the notice period defined in the agreement.
+-   **Queryable State:** Merchants can easily query the ledger for all active, suspended, or delinquent subscriptions for real-time analytics and reporting.
 
-## Core Concepts
+---
 
-### Actors
+## How It Works: The Subscription Lifecycle
 
--   **Merchant:** The provider of the service or product. They propose subscription agreements and receive payments.
--   **Subscriber:** The customer who agrees to the subscription terms and authorizes recurring payments.
--   **BillingEngine:** An automated party responsible for triggering the payment processing logic at the start of each billing period.
+The system is modeled around a core `Subscription.daml` contract and its interactions.
 
-### Daml Templates
+1.  **Offer & Acceptance:**
+    -   A `Merchant` offers a subscription plan to a `Subscriber`.
+    -   The `Subscriber` accepts the offer, creating a `Subscription` contract on the ledger. This contract is the single source of truth for the agreement, viewable by both parties.
 
--   **`SubscriptionAgreement`**: The master contract representing an active subscription between a Merchant and a Subscriber. It holds the terms, status, and next billing date.
--   **`SubscriptionAgreementProposal`**: An offer from a Merchant to a Subscriber to enter into a subscription. The Subscriber accepts this to create the `SubscriptionAgreement`.
--   **`PaymentAuthorization`**: A contract created by the Subscriber that gives the `BillingEngine` the authority to pull funds on their behalf for this specific subscription.
+2.  **Automated Billing:**
+    -   At the start of each billing period, an automated process (e.g., a trigger or off-chain service) calls the `Bill` choice on the active `Subscription` contract.
+    -   This action creates an `Invoice` contract, which represents the amount due for the current period.
 
-## Subscription Lifecycle
+3.  **Payment & Settlement:**
+    -   The `Invoice` is settled by the `Subscriber`. This is typically done via a Delivery-vs-Payment (DVP) transaction, where the subscriber transfers the required digital asset (e.g., a stablecoin) to the merchant in exchange for the invoice being marked as `Paid`.
 
-1.  **Proposal:** The Merchant creates a `SubscriptionAgreementProposal` and offers it to a potential Subscriber.
-2.  **Acceptance:** The Subscriber accepts the proposal, which atomically creates the active `SubscriptionAgreement` and a `PaymentAuthorization` contract.
-3.  **Billing Cycle:** On or after the `nextBillingDate`, the `BillingEngine` exercises the `ProcessPayment` choice on the `SubscriptionAgreement`.
-4.  **Payment Success:** If payment succeeds, the `nextBillingDate` is advanced to the next period, and the cycle continues.
-5.  **Payment Failure:** If payment fails, the subscription status moves to `InGracePeriod`, and a grace period deadline is set.
-6.  **Recovery:** If payment is made during the grace period, the subscription returns to `Active`.
-7.  **Suspension:** If the grace period expires without payment, the status moves to `Suspended`. The service should be suspended at this point.
-8.  **Termination:** The subscription can be terminated by the Subscriber at any time or by the Merchant under specific conditions (e.g., prolonged non-payment).
+4.  **Dunning (Handling Failed Payments):**
+    -   If an invoice is not paid by its due date, the system automatically transitions the subscription state:
+        -   `Active` -> `GracePeriod`: The subscriber is notified and given a few extra days to pay.
+        -   `GracePeriod` -> `Suspended`: If payment is still not made, the service is suspended. The contract remains, but the merchant is no longer obligated to provide service.
+        -   `Suspended` -> `Terminated`: After a final period, the subscription is terminated and archived.
+
+5.  **Cancellation:**
+    -   Either the Merchant or Subscriber can initiate a cancellation by exercising the `RequestCancellation` choice.
+    -   This creates a `PendingCancellation` contract. The other party must then confirm the cancellation, which transitions the main `Subscription` to a `Cancelled` state, respecting any predefined notice periods.
+
+---
 
 ## Merchant Integration Guide
 
-This guide explains how to interact with the Canton ledger via the JSON API to manage subscriptions.
+Integrating this system into your business involves interacting with the Canton ledger to create and manage subscriptions.
 
 ### Prerequisites
 
--   A running Canton participant node.
--   A party ID for your Merchant identity on the network.
--   An authentication token (JWT) for the JSON API, configured for your Merchant party.
+1.  **A Canton Party ID:** Your business must have a party identity on a Canton network participant node.
+2.  **Ledger API Access:** You need access to the JSON API of your participant node to send commands (create contracts, exercise choices).
 
-### Step 1: Create a Subscription Proposal
+### Step 1: Define Subscription Plans
 
-To onboard a new subscriber, you create a `SubscriptionAgreementProposal` contract.
+First, you must define the terms of your service offerings. While this starter kit doesn't have a dedicated `Plan` template, the core terms are captured directly in the `Subscription` contract upon creation. Key parameters include:
 
-**Endpoint:** `POST /v1/create`
-**Authorization:** `Bearer <your-merchant-jwt>`
+-   `merchant`, `subscriber`: The parties to the agreement.
+-   `price`: The amount due each billing period (Decimal).
+-   `period`: The billing cycle duration (e.g., 30 days).
+-   `gracePeriod`: How long the subscriber has to pay after a due date before suspension.
+-   `suspensionPeriod`: How long the service remains suspended before termination.
 
-**Payload:**
+### Step 2: Onboard a Subscriber
+
+To onboard a new subscriber, you create a `Subscription` contract with the agreed-upon terms.
+
+**Example: Create a Subscription via JSON API**
+
+Send a `POST /v1/create` request to your participant's JSON API endpoint:
 
 ```json
 {
-  "templateId": "Main:SubscriptionAgreementProposal",
+  "templateId": "Subscription:Subscription",
   "payload": {
-    "merchant": "MerchantPartyID",
-    "subscriber": "SubscriberPartyID",
-    "billingEngine": "BillingEnginePartyID",
-    "description": "Premium SaaS Plan",
-    "price": "19.99",
+    "merchant": "MerchantPartyID::...",
+    "subscriber": "SubscriberPartyID::...",
+    "price": "99.99",
     "currency": "USD",
-    "billingIntervalDays": 30,
-    "gracePeriodDays": 5,
-    "firstBillingDate": "2024-08-01"
+    "periodInDays": 30,
+    "nextBillingDate": "2024-10-01",
+    "gracePeriodInDays": 5,
+    "suspensionPeriodInDays": 15,
+    "cancellationNoticeInDays": 10,
+    "lastBilledDate": null,
+    "status": { "tag": "Active", "value": {} }
   }
 }
 ```
 
-The subscriber will see this proposal and can choose to accept it. Upon acceptance, the system automatically creates the active `SubscriptionAgreement`.
+This command needs to be submitted with a JWT token for the `merchant`. The subscriber will see the contract proposal and must exercise the `Accept` choice to activate it.
 
-### Step 2: Query for Active Subscriptions
+### Step 3: Automate Billing
 
-To get a list of all active subscriptions for your service, you can query the ledger for `SubscriptionAgreement` contracts where you are the merchant.
+You need a service that runs periodically (e.g., daily) to check for subscriptions that are due for billing.
 
-**Endpoint:** `POST /v1/query`
-**Authorization:** `Bearer <your-merchant-jwt>`
+1.  **Query for Billable Subscriptions:** Query the ledger for `Subscription` contracts where `nextBillingDate` is today or in the past and the status is `Active`.
+2.  **Exercise the `Bill` Choice:** For each contract found, exercise the `Bill` choice. This will generate a new `Invoice`.
 
-**Payload:**
+**Example: Exercise `Bill` choice via JSON API**
+
+Send a `POST /v1/exercise` request:
 
 ```json
 {
-  "templateIds": ["Main:SubscriptionAgreement"],
-  "query": {
-    "merchant": "MerchantPartyID",
-    "status": "Active"
-  }
+  "templateId": "Subscription:Subscription",
+  "contractId": "00e4e...b1a",
+  "choice": "Bill",
+  "argument": {}
 }
 ```
 
-This is useful for your internal systems to verify a user's subscription status before granting access to a service. You can also query for other statuses like `InGracePeriod` or `Suspended`.
+### Step 4: Monitor and Manage
 
-### Step 3: Handle Subscription Cancellation (Merchant Initiated)
+Use ledger queries to monitor the health of your subscription business.
 
-If you need to terminate a subscription (e.g., service discontinuation), you can exercise the `Cancel` choice on the `SubscriptionAgreement`.
+-   **Active Subscriptions:** `POST /v1/query` for `Subscription:Subscription` where you are the `merchant`.
+-   **Delinquent Subscriptions:** Query for `Subscription` contracts with status `GracePeriod` or `Suspended`.
+-   **Invoices:** Query for `Invoice:Invoice` to track paid and unpaid invoices.
 
-First, you need the Contract ID of the agreement you wish to cancel. You can get this from the query in Step 2.
+For advanced analytics, you can stream ledger data into a database like PostgreSQL using the Participant Query Store (PQS) for complex SQL-based reporting.
 
-**Endpoint:** `POST /v1/exercise`
-**Authorization:** `Bearer <your-merchant-jwt>`
+---
 
-**Payload:**
-
-```json
-{
-  "templateId": "Main:SubscriptionAgreement",
-  "contractId": "00e8b0b2e3a1b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0",
-  "choice": "Cancel",
-  "argument": {
-    "reason": "Service has been discontinued by merchant."
-  }
-}
-```
-
-This will archive the `SubscriptionAgreement` and `PaymentAuthorization`, effectively ending the subscription.
-
-## Running the Project Locally
+## For Developers: Local Setup
 
 ### Prerequisites
 
--   Daml SDK v3.1.0
--   Node.js v18+
+-   **DPM (Canton SDK 3.4.0+):** [Installation Guide](https://docs.digitalasset.com/canton/stable/getting-started/quickstart.html#install-the-sdk)
+-   **Node.js v18+ and npm**
 
 ### Instructions
 
-1.  **Start the Daml Ledger:**
-    Open a terminal in the project root and run:
-    ```bash
-    daml build
-    daml start
+1.  **Clone the Repository:**
+    ```sh
+    git clone https://github.com/your-org/canton-subscription-billing.git
+    cd canton-subscription-billing
     ```
-    This compiles the Daml code and starts a local Canton ledger with a JSON API endpoint at `http://localhost:7575`.
 
-2.  **Start the Frontend Application:**
-    Open a second terminal and navigate to the `frontend` directory:
-    ```bash
+2.  **Build Daml Contracts:**
+    Compile the Daml code into a DAR (Daml Archive).
+    ```sh
+    dpm build
+    ```
+    This generates `.daml/dist/canton-subscription-billing-0.1.0.dar`.
+
+3.  **Run a Local Canton Ledger (Sandbox):**
+    Start a local single-node Canton network. The JSON API will be available on port `7575`.
+    ```sh
+    dpm sandbox
+    ```
+
+4.  **Run Daml Script Tests:**
+    Execute the test suite defined in `daml/test/`.
+    ```sh
+    dpm test
+    ```
+
+5.  **Run the Frontend (Optional):**
+    ```sh
     cd frontend
     npm install
     npm start
     ```
-    This will launch the React-based user interface, which you can access at `http://localhost:3000`.
+    The React application will be available at `http://localhost:3000`.
 
 ## Project Structure
 
 ```
 .
-├── daml/                      # Daml smart contract source code
-│   └── Main.daml
-├── frontend/                  # React frontend application
-│   ├── public/
-│   └── src/
-├── .github/                   # GitHub Actions CI workflow
-├── docs/                      # Project documentation
+├── daml/                      # Daml smart contract models
+│   ├── Subscription.daml
+│   ├── Invoice.daml
+│   └── Cancellation.daml
+├── daml/test/                 # Daml Script tests
+│   ├── SubscriptionTest.daml
+│   └── CancellationTest.daml
+├── frontend/                  # React-based UI for interacting with the contracts
+├── .github/                   # GitHub Actions CI configuration
 ├── daml.yaml                  # Daml project configuration
-├── package.json
 └── README.md
 ```
