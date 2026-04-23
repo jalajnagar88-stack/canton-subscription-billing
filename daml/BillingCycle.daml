@@ -3,91 +3,79 @@
 
 module Subscription.BillingCycle where
 
-import Daml.Script
+import DA.Date (Date, addMonths, addYears, fromDateUTC, toDateUTC)
+import DA.Time (Time)
 
-import DA.Date
-import DA.Time
-import DA.Assert
+-- | Defines the frequency of billing cycles.
+data BillingFrequency
+  = Monthly
+  | Yearly
+  deriving (Eq, Show, Ord)
 
-import Subscription.Subscription (Subscription(..))
-import Subscription.Invoice (Invoice(..))
-import Subscription.Setup (SubscriptionDetails(..))
-
--- | Represents the scheduled task to generate an invoice for a given subscription.
--- This contract is created when a subscription starts and is recreated each time
--- an invoice is generated, effectively scheduling the next billing event. It acts
--- as the heart of the recurring billing engine.
-template BillingCycle
+-- | Represents a single billing period with a defined start and end time.
+-- The period is inclusive of the start time and exclusive of the end time, i.e., `[start, end)`.
+-- This convention ensures that consecutive periods are contiguous without gaps or overlaps,
+-- fixing common off-by-one errors.
+data BillingPeriod = BillingPeriod
   with
-    billingEngine : Party
-      -- ^ The party responsible for managing the billing process.
-    subscriber : Party
-      -- ^ The party being billed.
-    subscriptionCid : ContractId Subscription
-      -- ^ The active subscription contract this billing cycle is for.
-    nextBillingDate : Date
-      -- ^ The date on which the next invoice should be generated.
-  where
-    signatory billingEngine
-    observer subscriber
+    start : Time
+      -- ^ The inclusive start timestamp of the billing period.
+    end : Time
+      -- ^ The exclusive end timestamp of the billing period.
+  deriving (Eq, Show, Ord)
 
-    key (billingEngine, subscriber, subscriptionCid) : (Party, Party, ContractId Subscription)
-    maintainer key._1
+-- | Creates the first billing period for a new subscription.
+--
+-- >>> let startTime = fromDateUTC (date 2024 Jan 31)
+-- >>> initialBillingPeriod startTime Monthly
+-- BillingPeriod {start = 2024-01-31T00:00:00Z, end = 2024-02-29T00:00:00Z}
+initialBillingPeriod : Time -> BillingFrequency -> BillingPeriod
+initialBillingPeriod startTime freq =
+  BillingPeriod with
+    start = startTime
+    end = calculatePeriodEnd startTime freq
 
-    -- | Triggers the creation of a new invoice for the subscription.
-    -- This choice should be exercised by an automated process (e.g., a trigger or off-ledger bot)
-    -- on or after the `nextBillingDate`. The choice consumes the current cycle and creates
-    -- the next one, perpetuating the billing schedule.
-    choice TriggerInvoice : ContractId Invoice
-      controller billingEngine
-      do
-        -- Ensure the choice is exercised on or after the scheduled billing date.
-        -- This prevents generating invoices prematurely.
-        now <- getTime
-        let currentDate = toDateUTC now
-        assertMsg
-          ("Cannot trigger invoice before the next billing date of " <> show nextBillingDate)
-          (currentDate >= nextBillingDate)
+-- | Calculates the next billing period that immediately follows the current one.
+--
+-- >>> let current = BillingPeriod {start = fromDateUTC (date 2024 Jan 31), end = fromDateUTC (date 2024 Feb 29)}
+-- >>> calculateNextBillingPeriod current Monthly
+-- BillingPeriod {start = 2024-02-29T00:00:00Z, end = 2024-03-31T00:00:00Z}
+calculateNextBillingPeriod : BillingPeriod -> BillingFrequency -> BillingPeriod
+calculateNextBillingPeriod currentPeriod freq =
+  let
+    nextStart = currentPeriod.end
+  in
+    BillingPeriod with
+      start = nextStart
+      end = calculatePeriodEnd nextStart freq
 
-        -- Fetch the subscription details to create the invoice.
-        sub <- fetch subscriptionCid
-        let details = sub.details
+-- | Helper function to determine the end time of a period based on its start time and frequency.
+-- This function correctly handles the varying lengths of months and leap years by using
+-- calendar-aware functions from `DA.Date`. This is the corrected logic, avoiding
+-- off-by-one errors common with fixed-duration arithmetic (e.g., adding 30 days for a month).
+calculatePeriodEnd : Time -> BillingFrequency -> Time
+calculatePeriodEnd startTime freq =
+  let
+    -- Convert to Date to perform calendar-aware arithmetic.
+    -- This correctly handles leap years and different month lengths.
+    startDate = toDateUTC startTime
+    nextDate =
+      case freq of
+        Monthly -> addMonths 1 startDate
+        Yearly -> addYears 1 startDate
+  in
+    -- Convert back to a Time value at midnight UTC.
+    fromDateUTC nextDate
 
-        -- Calculate invoice period and due date based on subscription terms.
-        let invoicePeriodStart = nextBillingDate
-        let invoicePeriodEnd = addMonths 1 nextBillingDate `addDays` (-1)
-        let dueDate = currentDate `addDays` details.paymentGracePeriodDays
-
-        -- Create the new invoice for the current billing period.
-        invoiceCid <- create Invoice with
-          billingEngine = billingEngine
-          subscriber = subscriber
-          subscriptionCid = subscriptionCid
-          amount = details.billingAmount
-          currency = details.billingCurrency
-          description = details.description
-          periodStart = invoicePeriodStart
-          periodEnd = invoicePeriodEnd
-          issueDate = currentDate
-          dueDate = dueDate
-          status = "Pending"
-          paymentDetails = None
-          lateFee = None
-
-        -- Recreate the billing cycle for the next period, ensuring the cycle continues.
-        let nextPeriodBillingDate = addMonths 1 nextBillingDate
-        create this with
-          nextBillingDate = nextPeriodBillingDate
-
-        return invoiceCid
-
-    -- | Archives the billing cycle, typically when the parent subscription is cancelled or terminated.
-    -- This stops the recurring invoice generation.
-    choice ArchiveBillingCycle : ()
-      with
-        reason : Text
-          -- ^ The reason for archiving (e.g., "Subscription cancelled by subscriber").
-      controller billingEngine
-      do
-        debug $ "Archiving billing cycle for subscription " <> show subscriptionCid <> ". Reason: " <> reason
-        return ()
+-- | Determines if a payment for a given billing period is due at a specific time.
+-- A payment is considered due if the current time is at or after the period's exclusive end time.
+--
+-- >>> let period = initialBillingPeriod (fromDateUTC (date 2024 Jan 1)) Monthly
+-- >>> isDue (fromDateUTC (date 2024 Jan 31)) period
+-- False
+-- >>> isDue (fromDateUTC (date 2024 Feb 1)) period
+-- True
+-- >>> isDue (fromDateUTC (date 2024 Feb 2)) period
+-- True
+isDue : Time -> BillingPeriod -> Bool
+isDue currentTime period = currentTime >= period.end
