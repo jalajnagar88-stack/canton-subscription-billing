@@ -1,83 +1,88 @@
-# Subscription Billing Specification
+# Subscription Billing Lifecycle Specification
 
-## 1. Overview
+This document outlines the complete lifecycle of a subscription agreement, from its active state through payment failures, grace periods, suspension, and eventual termination. This process is managed by on-ledger Daml smart contracts to ensure atomicity, transparency, and automated enforcement.
 
-This document specifies the business logic for the recurring subscription billing and payment enforcement system built on Canton. It defines the lifecycle of a subscription, the process of a billing cycle, and the automated handling of payment failures, including grace periods, retries, and service state changes.
+## 1. Core States
 
-The system is designed to be automated, transparent, and enforceable through Daml smart contracts, ensuring both the service provider and the subscriber have a clear, shared understanding of the agreement terms.
+A subscription contract can exist in one of the following states, which dictates service access and billing actions.
 
-## 2. Key Entities
+| State | Description | Service Access |
+| :--- | :--- | :--- |
+| **Active** | The subscription is in good standing. All invoices are paid. | **Enabled** |
+| **PastDue** | The most recent payment failed. The subscription is in a grace period. | **Enabled** |
+| **Suspended** | The grace period expired without payment. | **Disabled** |
+| **Terminated** | The subscription has been permanently closed due to non-payment. | **Disabled** |
+| **Cancelled** | The subscription has been cancelled by the user. | **Disabled** |
 
--   **Provider**: The party offering a service and collecting subscription fees.
--   **Subscriber**: The party consuming the service and paying subscription fees.
--   **Subscription Agreement**: A Daml contract representing the active, ongoing agreement between the Provider and the Subscriber. It contains key terms like price, currency, and billing interval.
--   **Billing Engine**: An automated off-ledger process or on-ledger contract (e.g., triggered by a `TimeManager` service) that initiates the billing cycle.
+## 2. Standard Billing Cycle
 
-## 3. Subscription Lifecycle States
+- **Period**: Billing occurs on a recurring monthly basis, calculated from the `startDate` of the `SubscriptionAgreement` contract.
+- **Invoice Generation**: An `Invoice` contract is created on the ledger at the beginning of each billing cycle (e.g., on the 15th of each month if the subscription started on the 15th).
+- **Payment Attempt**: Immediately and atomically upon invoice creation, the billing engine attempts to pull the invoiced amount from the subscriber's pre-authorized payment method.
+- **Success**: If the payment succeeds, the `Invoice` is marked as `Paid`, and the `SubscriptionAgreement` remains `Active`.
+- **Failure**: If the payment fails, the `Invoice` is marked as `Unpaid`, and the Dunning Process (see below) begins.
 
-A subscription contract progresses through a series of states based on payment status.
+## 3. Dunning & Failure Handling Process
 
-| State           | Description                                                                                             | Transitions To                                                               |
-| --------------- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `Pending`       | The initial state after a subscription proposal is made but before the subscriber has accepted.         | `Active` (on acceptance)                                                     |
-| `Active`        | The subscription is in good standing. The service is available to the subscriber.                       | `InGracePeriod` (on payment failure), `Terminated` (on cancellation)         |
-| `InGracePeriod` | A payment has failed. The service remains available for a limited time while payment is retried.        | `Active` (on successful retry), `Suspended` (on grace period expiration)     |
-| `Suspended`     | The grace period has expired without successful payment. The service is unavailable to the subscriber.  | `Active` (on manual payment of dues), `Terminated` (on suspension expiration)|
-| `Terminated`    | The subscription has been permanently ended, either by cancellation or by prolonged non-payment.         | (End State)                                                                  |
+The dunning process is the automated sequence of actions taken in response to a failed payment. The timeline is relative to the date of the initial failed payment attempt (`T+0`).
 
-## 4. Billing Cycle
+### Step 1: Initial Failure & Grace Period Start (`T+0`)
 
-The billing cycle is the core process for charging the subscriber.
+- The initial automated payment attempt fails.
+- The `SubscriptionAgreement` state transitions from `Active` to `PastDue`.
+- The **14-day grace period** begins.
+- The subscriber is notified of the payment failure and the start of the grace period.
+- Service access remains **enabled** during the grace period.
 
-1.  **Trigger**: On or after the `nextBillingDate` stored in the `SubscriptionAgreement` contract, the Billing Engine initiates the process.
-2.  **Invoice Creation**: The system generates a `PaymentRequest` contract for the billing period amount. This contract is owed by the Subscriber to the Provider.
-3.  **Payment Attempt**: The Provider exercises a choice on the `PaymentRequest` to automatically debit the funds from a pre-authorized account or contract designated by the Subscriber.
-    -   **On Success**: The `PaymentRequest` is marked as `Paid` and archived. The `SubscriptionAgreement` contract's `lastPaidDate` and `nextBillingDate` are updated. The subscription remains `Active`.
-    -   **On Failure**: The `PaymentRequest` is marked as `Failed`. The `SubscriptionAgreement` contract transitions to the `InGracePeriod` state.
+### Step 2: Payment Retries
 
-## 5. Failed Payment Handling
+Automated payment retries are scheduled within the grace period to maximize the chance of recovery.
 
-This process is initiated immediately upon a failed payment attempt.
+- **Retry 1 (`T + 3 days`)**: The system makes a second attempt to process the payment for the outstanding invoice.
+- **Retry 2 (`T + 7 days`)**: The system makes a third attempt.
+- **Retry 3 (`T + 13 days`)**: The final automated attempt is made before the grace period expires.
 
-### 5.1. Grace Period
+If any retry attempt is successful, the `Invoice` is marked `Paid`, the `SubscriptionAgreement` state reverts to `Active`, and the dunning process for that invoice is terminated.
 
--   **Entry**: The `SubscriptionAgreement` contract transitions to the `InGracePeriod` state.
--   **Duration**: **7 calendar days** from the date of the initial payment failure.
--   **Service Status**: The service remains fully accessible to the Subscriber during the grace period.
--   **Notifications**: The system should notify the Subscriber of the payment failure and the start of the grace period.
+### Step 3: Service Suspension (`T + 14 days`)
 
-### 5.2. Retry Logic
+- If the grace period ends and the invoice remains unpaid, the subscription is suspended.
+- The `SubscriptionAgreement` state transitions from `PastDue` to `Suspended`.
+- Service access is **disabled**. Off-ledger systems consuming the ledger state will enforce this access change.
+- The subscriber is notified of the service suspension.
+- The subscription will remain in the `Suspended` state for **30 days**.
 
-Within the grace period, the Billing Engine will automatically retry the payment.
+### Step 4: Reactivation from Suspension
 
--   **Retry Schedule**:
-    -   **Retry 1**: 3 days after the initial failure.
-    -   **Retry 2**: 5 days after the initial failure.
-    -   **Retry 3**: 7 days after the initial failure (on the final day of the grace period).
--   **Successful Retry**: If any retry attempt succeeds, the `SubscriptionAgreement` immediately transitions back to the `Active` state. The `nextBillingDate` is calculated from the *original* due date, not the date of the successful retry.
--   **Failed Retries**: If all retries fail, the grace period expires.
+- During the 30-day suspension period, the subscriber can manually trigger a payment for all outstanding invoices.
+- If payment is successful, the `SubscriptionAgreement` state transitions back to `Active`, and service access is immediately restored.
 
-## 6. Service Suspension
+### Step 5: Termination (`T + 44 days`)
 
--   **Trigger**: The grace period ends without a successful payment.
--   **State Transition**: The `SubscriptionAgreement` contract transitions to the `Suspended` state.
--   **Effect**: The Subscriber's access to the service is revoked. Off-ledger systems should enforce this based on the contract state.
--   **Duration**: The subscription will remain in the `Suspended` state for **30 calendar days**.
--   **Reactivation**: The Subscriber can reactivate the service at any point during the suspension period by manually paying all outstanding invoices. Upon successful payment, the contract returns to the `Active` state.
+- If the subscription remains in the `Suspended` state for the full 30-day suspension period (`T+14` grace + `T+30` suspension), it is automatically and permanently terminated.
+- The `SubscriptionAgreement` state transitions to `Terminated`, and the contract is archived.
+- This action is **irreversible**.
+- Any outstanding `Invoice` contracts are archived and marked as written off in an accounting system.
+- To regain service access, the user must create a new subscription.
 
-## 7. Termination
+## 4. Lifecycle Summary Timeline
 
--   **Trigger 1 (Non-Payment)**: The 30-day suspension period expires without payment.
--   **Trigger 2 (Cancellation)**: The Subscriber or Provider explicitly exercises a cancellation choice on the `SubscriptionAgreement` contract. Subscriber cancellation is effective at the end of the current paid billing period.
--   **Effect**: The `SubscriptionAgreement` contract is archived, permanently ending the relationship. Outstanding invoices may remain for collection purposes.
+![Billing Lifecycle Timeline](https://via.placeholder.com/1200x200.png?text=T%2B0%3A%20Fail%20-%3E%20T%2B14%3A%20Suspend%20-%3E%20T%2B44%3A%20Terminate)
 
-## 8. Specification Parameters
+| Day | Event | State | Service Access |
+| :--- | :--- | :--- | :--- |
+| **T+0** | Initial Payment Fails | `PastDue` | **Enabled** |
+| T+1 | - | `PastDue` | **Enabled** |
+| T+3 | Retry #1 | `PastDue` | **Enabled** |
+| T+7 | Retry #2 | `PastDue` | **Enabled** |
+| T+13 | Retry #3 | `PastDue` | **Enabled** |
+| **T+14** | Grace Period Ends | `Suspended` | **Disabled** |
+| T+15..43 | - | `Suspended` | **Disabled** |
+| **T+44** | Suspension Period Ends | `Terminated` | **Disabled** |
 
-| Parameter                   | Value            | Description                                                            |
-| --------------------------- | ---------------- | ---------------------------------------------------------------------- |
-| Billing Interval            | Monthly          | Frequency of billing cycles.                                           |
-| Grace Period Duration       | 7 days           | Time after a failed payment where the service remains active.          |
-| Retry Attempts              | 3                | Number of automatic payment retries during the grace period.           |
-| Retry Schedule (Days After Failure) | `[3, 5, 7]`    | The specific days on which retries are attempted.                      |
-| Suspension Period Duration  | 30 days          | Time a subscription remains suspended before being terminated.         |
-| Cancellation Policy         | End of term      | Subscriber cancellation is effective at the end of the paid-for period.|
+## 5. Service Level Agreements (SLAs)
+
+- **Invoice Generation**: Invoices for a new billing period will be generated on-ledger within 1 hour of the cycle start time (00:00 UTC on the billing day).
+- **Payment Attempt**: The initial payment attempt will be executed atomically with invoice creation.
+- **State Transitions**: All state transitions (`Active` -> `PastDue`, `PastDue` -> `Suspended`, etc.) are guaranteed by the Daml ledger to be atomic and consistent with the rules defined in the smart contracts. There is no risk of a payment being processed without the subscription state being updated correctly.
+- **Notification Delivery**: Notifications for state changes and payment events will be dispatched to an off-ledger notification service within 5 minutes of the on-ledger transaction being committed. Final delivery depends on the external service provider.
